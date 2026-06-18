@@ -1,52 +1,78 @@
-// Patch the @qvac/sdk TTS language schema to unlock all 18 languages the TTS package
-// actually supports. The SDK 0.12.x ships a zod enum capped at en/es/de/it
-// (dist/schemas/text-to-speech.js), which the QVAC SDK team confirmed is a schema-validation
-// bug, not a model limit: "We currently support 18 languages at TTS package level but the
-// SDK has an issue in the schema validation that only allows those 4. We will fix it in the
-// SDK. Meanwhile, patch locally to bypass it." This script does exactly that, idempotently.
+// On-disk patches to the installed @qvac/sdk, applied before the SDK is
+// imported. The SDK worker re-imports the SDK from disk, so these MUST be
+// on-disk edits (an in-memory monkey-patch would not reach the worker). All
+// patches are idempotent and re-apply cleanly after an `npm install` (which
+// restores the original files). server.js runs patchSdk() automatically.
 //
-// The validation runs in the SDK worker process too, which re-imports the SDK from disk, so
-// the patch must live on disk (an in-memory monkey-patch would not reach the worker). Re-run
-// after any `npm install`, which restores the original file. server.js runs it automatically.
+// What is patched — Chatterbox streaming/perf knobs: the SDK's chatterbox plugin
+// only forwards `language` + `useGPU` to the @qvac/tts-ggml engine and its load
+// schema is `.strict()` (rejects unknown keys). The engine itself accepts
+// `streamChunkTokens`, `streamFirstChunkTokens`, `cfmSteps`, `threads`, and
+// `nGpuLayers` — needed for low-latency chunk streaming and the 1-step CFM
+// speedup. We (a) allow these keys in the schema and (b) forward them in
+// createChatterboxModel. Tracked for upstream in the SDK 0.14.0 ticket; remove
+// this script once those knobs are exposed natively.
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 
-// The 18 languages the TTS package supports (per the QVAC SDK team).
-const LANGS = [
-  ["en", "English"], ["es", "Spanish"], ["fr", "French"], ["de", "German"], ["it", "Italian"],
-  ["pt", "Portuguese"], ["nl", "Dutch"], ["pl", "Polish"], ["tr", "Turkish"], ["sv", "Swedish"],
-  ["da", "Danish"], ["fi", "Finnish"], ["no", "Norwegian"], ["el", "Greek"], ["ms", "Malay"],
-  ["sw", "Swahili"], ["ar", "Arabic"], ["ko", "Korean"],
-];
+// Extra chatterbox modelConfig knobs to allow + forward (schema + plugin).
+const KNOBS = ["streamChunkTokens", "streamFirstChunkTokens", "cfmSteps", "threads", "nGpuLayers", "seed"];
 
-function resolveSchemaFile() {
+// Robustly locate the installed SDK's dist/ dir. (The previous implementation
+// used main.indexOf("@qvac/sdk"), which fails on Windows because require.resolve
+// returns backslash paths -> "@qvac\\sdk" never matches "@qvac/sdk".)
+function distDir() {
   const require = createRequire(import.meta.url);
-  const main = require.resolve("@qvac/sdk");                 // .../@qvac/sdk/dist/index.js
-  const root = main.slice(0, main.indexOf("@qvac/sdk") + "@qvac/sdk".length);
-  return path.join(root, "dist", "schemas", "text-to-speech.js");
+  const main = require.resolve("@qvac/sdk"); // .../@qvac/sdk/dist/index.js
+  return path.dirname(main);
 }
 
-export function patchSdkTtsLanguages() {
-  let file;
-  try { file = resolveSchemaFile(); } catch { console.error("[patch-sdk] could not resolve @qvac/sdk"); return false; }
+// Allow the extra knob keys in the chatterbox runtime config so the `.strict()`
+// load schema does not reject them. Regex-based so it tolerates the language
+// schema name differing across SDK versions (ttsLanguageSchema in 0.12.x,
+// ttsChatterboxLanguageSchema in 0.13.x).
+function patchTtsSchemaKnobs(dist) {
+  const file = path.join(dist, "schemas", "text-to-speech.js");
   if (!existsSync(file)) { console.error("[patch-sdk] schema file not found:", file); return false; }
   const src = readFileSync(file, "utf8");
+  if (src.includes("streamChunkTokens:")) { console.log("[patch-sdk] schema knobs already patched."); return true; }
 
-  const arrayLiteral = "export const TTS_LANGUAGES = [\n" +
-    LANGS.map(([code, name]) => `    "${code}", // ${name}`).join("\n") + "\n];";
+  // Match the chatterbox runtime config object and capture up to its closing `});`.
+  const re = /(export const ttsChatterboxRuntimeConfigSchema = z\.object\(\{[\s\S]*?useGPU: z\.boolean\(\)\.optional\(\),\n)(\}\);)/;
+  if (!re.test(src)) { console.error("[patch-sdk] ttsChatterboxRuntimeConfigSchema block not found; SDK layout changed."); return false; }
 
-  // Already patched? (more than the original 4 codes present)
-  const current = (src.match(/export const TTS_LANGUAGES = \[([\s\S]*?)\];/) || [])[1] || "";
-  const codeCount = (current.match(/"[a-z]{2}"/g) || []).length;
-  if (codeCount >= LANGS.length) { console.log(`[patch-sdk] already patched (${codeCount} languages).`); return true; }
-
-  if (!/export const TTS_LANGUAGES = \[[\s\S]*?\];/.test(src)) { console.error("[patch-sdk] TTS_LANGUAGES block not found; SDK layout changed."); return false; }
-  const patched = src.replace(/export const TTS_LANGUAGES = \[[\s\S]*?\];/, arrayLiteral);
-  writeFileSync(file, patched);
-  console.log(`[patch-sdk] patched ${file} -> ${LANGS.length} languages.`);
+  const knobLines = KNOBS.map((k) => `    ${k}: z.number().optional(),`).join("\n") + "\n";
+  writeFileSync(file, src.replace(re, `$1${knobLines}$2`));
+  console.log(`[patch-sdk] patched schema to allow ${KNOBS.length} chatterbox knobs.`);
   return true;
 }
 
+// Forward the knobs to the @qvac/tts-ggml constructor (top-level options).
+function patchChatterboxPlugin(dist) {
+  const file = path.join(dist, "server", "bare", "plugins", "tts-ggml", "plugin.js");
+  if (!existsSync(file)) { console.error("[patch-sdk] tts-ggml plugin not found:", file); return false; }
+  const src = readFileSync(file, "utf8");
+  if (src.includes("streamChunkTokens:")) { console.log("[patch-sdk] plugin knobs already patched."); return true; }
+
+  const anchor = `        files: { t3Model, s3genModel },\n`;
+  if (!src.includes(anchor)) { console.error("[patch-sdk] createChatterboxModel anchor not found; SDK layout changed."); return false; }
+
+  const forward = KNOBS.map(
+    (k) => `        ...(config.${k} !== undefined ? { ${k}: config.${k} } : {}),\n`
+  ).join("");
+  writeFileSync(file, src.replace(anchor, anchor + forward));
+  console.log(`[patch-sdk] patched plugin to forward ${KNOBS.length} chatterbox knobs.`);
+  return true;
+}
+
+export function patchSdk() {
+  let dist;
+  try { dist = distDir(); } catch { console.error("[patch-sdk] could not resolve @qvac/sdk"); return false; }
+  const a = patchTtsSchemaKnobs(dist);
+  const b = patchChatterboxPlugin(dist);
+  return a && b;
+}
+
 // Run directly: `node patch-sdk.mjs`
-if (import.meta.url === `file://${process.argv[1]}`) patchSdkTtsLanguages();
+if (import.meta.url === `file://${process.argv[1]}`) patchSdk();

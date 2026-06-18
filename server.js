@@ -31,11 +31,11 @@ import { spawn } from "child_process";
 import { randomUUID } from "crypto";
 import os from "os";
 import path from "path";
-import { patchSdkTtsLanguages } from "./patch-sdk.mjs";
-// Unlock all 18 TTS languages BEFORE the SDK module evaluates. ESM static imports are
-// hoisted, so the SDK is imported DYNAMICALLY here (after the on-disk schema patch runs);
-// this also keeps it working after an `npm install` restores the original SDK file.
-patchSdkTtsLanguages();
+import { patchSdk } from "./patch-sdk.mjs";
+// Forward the chatterbox streaming/perf knobs BEFORE the SDK module evaluates. ESM static
+// imports are hoisted, so the SDK is imported DYNAMICALLY here (after the on-disk patch runs);
+// this also keeps it working after an `npm install` restores the original SDK files.
+patchSdk();
 const {
   loadModel, unloadModel, transcribe, translate, textToSpeech,
   WHISPER_BASE_Q8_0, WHISPER_ITALIAN_BASE_Q8_0, WHISPER_SPANISH_TINY_Q8_0, WHISPER_FRENCH_BASE_Q8_0,
@@ -57,10 +57,9 @@ const VOICES_JSON = path.join(STORE_DIR, "voices.json");
 const EMAILS_JSON = path.join(STORE_DIR, "emails.json");   // captured "Receive Prototype Link" emails
 mkdirSync(VOICES_DIR, { recursive: true });
 
-// Output (spoken) languages. The TTS package supports 18 languages; an SDK schema bug capped
-// it at en/es/de/it until we patched it (see patch-sdk.mjs). We expose every language that has
-// BOTH a TTS voice AND a Bergamot translation path (all 18 except Swahili, which has no EN->SW
-// translation model). This is what unlocked French/Portuguese/Arabic/Korean/... as output.
+// Output (spoken) languages. The Chatterbox TTS model supports 18 languages (all shipped in
+// SDK 0.13.x). We expose every language that has BOTH a TTS voice AND a Bergamot translation
+// path (all 18 except Swahili, which has no EN->SW translation model).
 const TTS_LANGS = {
   en: "English", es: "Espanol", fr: "Francais", de: "Deutsch", it: "Italiano",
   pt: "Portugues", nl: "Nederlands", pl: "Polski", tr: "Turkce", sv: "Svenska",
@@ -86,6 +85,17 @@ const BERGAMOT = {
 };
 
 const CHATTERBOX_SR = 24000;
+// Engine threads: tts-ggml caps its own default at 4; on bigger boxes we lift it.
+const THREADS = Math.min(os.cpus().length, 8);
+// Native chunk-streaming + 1-step CFM knobs (forwarded to @qvac/tts-ggml via patch-sdk.mjs).
+// streamFirstChunkTokens kept small for low first-audio-out; streamChunkTokens ~= 1s/chunk.
+const TTS_STREAM_CFG = { streamChunkTokens: 25, streamFirstChunkTokens: 10, cfmSteps: 1, threads: THREADS };
+const TTS_LRU_MAX = 2;   // keep up to 2 reference-matched TTS models resident (RAM-gated)
+// Synthesis MUST go through sentenceStream: @qvac/tts-ggml 0.2.x (SDK 0.13.x) runs
+// away to a fixed ~40s of babble when a multi-sentence string (~>100 graphemes) is
+// fed as a single utterance. runStream splits on sentence boundaries (merged up to
+// this many graphemes per chunk) so each chunk stays under the runaway threshold.
+const TTS_MAX_CHUNK_SCALARS = 80;
 const log = (m) => console.log(m);
 
 // ---------- voice store (persistent, multi-voice) ----------
@@ -109,10 +119,15 @@ function activeRefPath() {
 }
 let store = loadStore();
 
-// ---------- model caches (RAM-aware: keep one TTS resident) ----------
+// ---------- model caches ----------
 const whisperCache = new Map();   // lang -> modelId
 const nmtCache = new Map();       // `${from}|${to}` -> modelId
-let tts = { key: null, id: null };
+// TTS: small LRU keyed by `${ref}|${lang}`. Both are load-time params, so each
+// (voice, target-language) pair is its own resident model; LRU(2) lets the user
+// flip between two target languages without paying a multi-GB reload each time.
+const ttsCache = new Map();       // key -> modelId  (insertion order = LRU order)
+const ttsLoading = new Map();     // key -> Promise<modelId>  (dedupe concurrent loads)
+const ttsWarmed = new Set();      // modelIds already primed with a throwaway synth
 
 // ---------- download-progress broadcast (SSE) ----------
 // The SDK downloads model weights on first use (into ~/.qvac). We surface that
@@ -132,9 +147,14 @@ async function withProgress(phase, run) {
   }
 }
 
+// Drop ALL resident TTS models. Called when the active voice changes (enroll /
+// select / delete) so stale (old-reference) models do not linger in RAM.
 async function dropTts() {
-  if (tts.id) { try { await unloadModel({ modelId: tts.id, clearStorage: false }); } catch (e) {} }
-  tts = { key: null, id: null };
+  for (const id of ttsCache.values()) {
+    try { await unloadModel({ modelId: id, clearStorage: false }); } catch (e) {}
+    ttsWarmed.delete(id);
+  }
+  ttsCache.clear();
 }
 
 async function ensureWhisper(lang) {
@@ -144,7 +164,7 @@ async function ensureWhisper(lang) {
   const id = await withProgress("speech recognition", (onProgress) => loadModel({
     modelSrc: STT_WHISPER[lang],
     modelType: "whisper",
-    modelConfig: { audio_format: "f32le", strategy: "greedy", n_threads: 4, language: lang, temperature: 0.0 },
+    modelConfig: { audio_format: "f32le", strategy: "greedy", n_threads: THREADS, language: lang, temperature: 0.0 },
     onProgress,
   }));
   whisperCache.set(lang, id);
@@ -170,29 +190,78 @@ async function ensureNmt(from, to) {
   return id;
 }
 
-// Reference-matched TTS keyed by (active reference, targetLang). Both are load-time, so changing either reloads.
+// Reference-matched TTS keyed by (active reference, targetLang). Both are
+// load-time, so each pair is its own model. Served from an LRU(TTS_LRU_MAX);
+// concurrent loads of the same key are deduped so a background pre-warm and a
+// real request never double-load.
 async function ensureTts(lang) {
   const ref = activeRefPath();
   if (!ref || !existsSync(ref)) throw new Error("No voice enrolled. Enroll a voice first.");
   if (!TTS_LANGS[lang]) throw new Error(`Output voice does not support language "${lang}"`);
   const key = `${ref}|${lang}`;
-  if (tts.key === key && tts.id) return tts.id;
-  await dropTts();
-  log(`Loading reference-matched TTS (target=${lang})... first load for this voice+language is the slow step.`);
-  const id = await withProgress("voice", (onProgress) => loadModel({
-    modelSrc: TTS_T3_MULTILINGUAL_CHATTERBOX_Q8_0.src,
-    modelType: "tts",
-    modelConfig: {
-      ttsEngine: "chatterbox",
-      language: lang,
-      s3genModelSrc: TTS_S3GEN_MULTILINGUAL_CHATTERBOX.src,
-      referenceAudioSrc: ref,
-      useGPU: true,
-    },
-    onProgress: (p) => { if (p && p.percentage != null) { log(`  chatterbox: ${p.percentage.toFixed(0)}%`); onProgress(p); } },
-  }));
-  tts = { key, id };
-  return id;
+  if (ttsCache.has(key)) {
+    const id = ttsCache.get(key);
+    ttsCache.delete(key); ttsCache.set(key, id);   // bump to most-recently-used
+    return id;
+  }
+  if (ttsLoading.has(key)) return ttsLoading.get(key);
+
+  const loadPromise = (async () => {
+    log(`Loading reference-matched TTS (target=${lang})... first load for this voice+language is the slow step.`);
+    const id = await withProgress("voice", (onProgress) => loadModel({
+      modelSrc: TTS_T3_MULTILINGUAL_CHATTERBOX_Q8_0.src,
+      modelType: "tts",
+      modelConfig: {
+        ttsEngine: "chatterbox",
+        language: lang,
+        s3genModelSrc: TTS_S3GEN_MULTILINGUAL_CHATTERBOX.src,
+        referenceAudioSrc: ref,
+        useGPU: true,
+        ...TTS_STREAM_CFG,
+      },
+      onProgress: (p) => { if (p && p.percentage != null) { log(`  chatterbox: ${p.percentage.toFixed(0)}%`); onProgress(p); } },
+    }));
+    ttsCache.set(key, id);
+    // Evict least-recently-used beyond the cap.
+    while (ttsCache.size > TTS_LRU_MAX) {
+      const oldKey = ttsCache.keys().next().value;
+      const oldId = ttsCache.get(oldKey);
+      ttsCache.delete(oldKey);
+      ttsWarmed.delete(oldId);
+      try { await unloadModel({ modelId: oldId, clearStorage: false }); } catch (e) {}
+      log(`Evicted TTS model (LRU): ${oldKey}`);
+    }
+    return id;
+  })();
+  ttsLoading.set(key, loadPromise);
+  try { return await loadPromise; }
+  finally { ttsLoading.delete(key); }
+}
+
+// Prime a freshly-loaded model with a tiny throwaway synthesis so the first
+// real request runs on warm GPU kernels (cold first-call is ~2x slower).
+async function prewarmTts(id) {
+  if (!id || ttsWarmed.has(id)) return;
+  ttsWarmed.add(id);
+  try {
+    const out = textToSpeech({
+      modelId: id, text: "ok", inputType: "text",
+      stream: true, sentenceStream: true, sentenceStreamMaxChunkScalars: TTS_MAX_CHUNK_SCALARS,
+    });
+    for await (const _ of out.bufferStream) { /* drain */ }
+  } catch (e) { ttsWarmed.delete(id); }
+}
+
+// Background warm of the active voice for a likely target language. Fired after
+// enroll / select so the model is loaded AND warm by the time the user speaks.
+function defaultTargetFor(fromLang) {
+  return Object.keys(TTS_LANGS).find((l) => l !== fromLang) || "en";
+}
+function warmActiveVoice() {
+  const v = store.voices.find((x) => x.id === store.activeId);
+  if (!v) return;
+  const lang = defaultTargetFor(v.lang || "en");
+  ensureTts(lang).then(prewarmTts).catch((e) => log(`warm skipped: ${e.message}`));
 }
 
 // ---------- audio helpers ----------
@@ -243,6 +312,33 @@ function trimSpeech(samples, sr) {
   const out = arr.subarray(s0, s1);
   if (out.length < sr * 0.4) return arr;
   return out;
+}
+
+// Trailing-only silence trim for the streamed tail. We stream the bulk of the
+// audio as it arrives and hold back the last ~1s; at the end we drop trailing
+// low-energy (Chatterbox can append a quiet tail) but keep a short 0.3s pad.
+function trimTrailing(samples, sr) {
+  const n = samples.length;
+  const win = Math.max(1, Math.floor(sr * 0.02));
+  if (n < win * 5) return samples;
+  const thr = 0.012;            // normalized RMS floor
+  let last = Math.floor(n / win) - 1;
+  while (last >= 0) {
+    let s = 0; const base = last * win;
+    for (let i = 0; i < win; i++) { const v = samples[base + i] / 32768; s += v * v; }
+    if (Math.sqrt(s / win) >= thr) break;
+    last--;
+  }
+  if (last < 0) return samples;  // all quiet -> leave as-is
+  const tailKeep = Math.ceil(0.30 / 0.02);
+  const end = Math.min(n, (last + 1 + tailKeep) * win);
+  return samples.slice(0, end);
+}
+// Write an array of int16-range sample numbers to the response as raw PCM (Int16LE).
+function writeInt16(res, nums) {
+  if (!nums.length) return;
+  const a = Int16Array.from(nums);
+  res.write(Buffer.from(a.buffer, a.byteOffset, a.byteLength));
 }
 
 // ---------- http helpers ----------
@@ -328,6 +424,7 @@ const server = http.createServer(async (req, res) => {
         store.activeId = id;
         saveStore();
         await dropTts();   // new active voice -> next speak loads it
+        warmActiveVoice();  // begin loading + priming in the background
         log(`Voice enrolled: "${name}" (${(buf.length / 1024).toFixed(0)} KB).`);
         return send(res, 200, { voice: publicVoice(voice), activeId: store.activeId });
       } finally { try { if (existsSync(inPath)) unlinkSync(inPath); } catch {} }
@@ -337,7 +434,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && pathOnly === "/api/voices/select") {
       const { id } = JSON.parse((await readBody(req)).toString() || "{}");
       if (!store.voices.find((v) => v.id === id)) return send(res, 404, { error: "Voice not found." });
-      if (store.activeId !== id) { store.activeId = id; saveStore(); await dropTts(); }
+      if (store.activeId !== id) { store.activeId = id; saveStore(); await dropTts(); warmActiveVoice(); }
       return send(res, 200, { ok: true, activeId: store.activeId });
     }
 
@@ -387,7 +484,9 @@ const server = http.createServer(async (req, res) => {
       } finally { for (const f of [inPath, wavPath]) { try { if (existsSync(f)) unlinkSync(f); } catch {} } }
     }
 
-    // Speak: translate text from->to, synthesize in the ACTIVE voice (target language). Returns wav (base64).
+    // Speak: translate text from->to, synthesize in the ACTIVE voice (target language).
+    // Streams raw Int16LE PCM @ 24k as the engine produces it, so the client can start
+    // playing within a few hundred ms instead of waiting for the whole utterance.
     if (req.method === "POST" && pathOnly === "/api/speak") {
       if (!activeRefPath()) return send(res, 400, { error: "No voice enrolled. Enroll a voice first." });
       const body = JSON.parse((await readBody(req)).toString() || "{}");
@@ -407,13 +506,38 @@ const server = http.createServer(async (req, res) => {
       }
       log(`Speak: "${text.slice(0, 40)}" (${from}) -> "${translated.slice(0, 40)}" (${to})`);
 
+      // Everything that can fail (translate, model load) happens before headers go out,
+      // so error paths still return clean JSON. Once we start the PCM stream we can only end it.
       const ttsId = await ensureTts(to);
-      const out = textToSpeech({ modelId: ttsId, text: translated, inputType: "text", stream: false });
-      const audio = await out.buffer;
-      const trimmed = trimSpeech(audio, CHATTERBOX_SR);
-      log(`TTS ${audio.length} -> ${trimmed.length} samples (${(trimmed.length / CHATTERBOX_SR).toFixed(2)}s after trim)`);
-      const wav = pcmToWav(trimmed, CHATTERBOX_SR);
-      return send(res, 200, { translated, audio_base64: wav.toString("base64"), sample_rate: CHATTERBOX_SR });
+      res.writeHead(200, {
+        "Content-Type": "application/octet-stream",
+        "Cache-Control": "no-store",
+        "X-Sample-Rate": String(CHATTERBOX_SR),
+        "X-Translated": encodeURIComponent(translated),
+      });
+
+      const out = textToSpeech({
+        modelId: ttsId, text: translated, inputType: "text",
+        stream: true, sentenceStream: true, sentenceStreamMaxChunkScalars: TTS_MAX_CHUNK_SCALARS,
+      });
+      const FRAME = Math.floor(CHATTERBOX_SR * 0.2);     // flush ~200ms at a time
+      const HOLDBACK = Math.floor(CHATTERBOX_SR * 0.5);  // hold last ~0.5s for trailing trim (keeps first-audio low)
+      const t0 = process.hrtime.bigint();
+      let firstMs = -1, total = 0;
+      let pending = [];
+      for await (const s of out.bufferStream) {
+        if (firstMs < 0) firstMs = Number(process.hrtime.bigint() - t0) / 1e6;
+        pending.push(s); total++;
+        if (pending.length > HOLDBACK + FRAME) {
+          writeInt16(res, pending.splice(0, pending.length - HOLDBACK));
+        }
+      }
+      const tail = trimTrailing(pending, CHATTERBOX_SR);
+      writeInt16(res, tail);
+      res.end();
+      const trimmedTotal = total - (pending.length - tail.length);
+      log(`TTS stream: first-audio ${firstMs.toFixed(0)}ms, ${trimmedTotal} samples (${(trimmedTotal / CHATTERBOX_SR).toFixed(2)}s)`);
+      return;
     }
 
     send(res, 404, { error: "not found" });
