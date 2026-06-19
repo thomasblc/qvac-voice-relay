@@ -7,6 +7,6 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "@qvac/sdk": "^0.12.1"
+    "@qvac/sdk": "^0.13.5"
   }
 }

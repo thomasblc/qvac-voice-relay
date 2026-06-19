@@ -441,15 +441,64 @@
         if(micCtrl) setSpeakListening();
       });
 
+      // ---- streaming playback via Web Audio ----
+      // The server streams raw Int16LE PCM as the engine produces it; we schedule
+      // each piece back-to-back on an AudioContext so audio starts within a few
+      // hundred ms instead of waiting for the whole utterance to synthesize.
+      var audioCtx=null;
+      function getCtx(){ if(!audioCtx) audioCtx=new (window.AudioContext||window.webkitAudioContext)(); return audioCtx; }
+      function pcmToWavBlob(int16,sr){
+        var n=int16.length, buf=new ArrayBuffer(44+n*2), dv=new DataView(buf);
+        function ws(o,s){ for(var i=0;i<s.length;i++) dv.setUint8(o+i,s.charCodeAt(i)); }
+        ws(0,"RIFF"); dv.setUint32(4,36+n*2,true); ws(8,"WAVE"); ws(12,"fmt ");
+        dv.setUint32(16,16,true); dv.setUint16(20,1,true); dv.setUint16(22,1,true);
+        dv.setUint32(24,sr,true); dv.setUint32(28,sr*2,true); dv.setUint16(32,2,true); dv.setUint16(34,16,true);
+        ws(36,"data"); dv.setUint32(40,n*2,true);
+        for(var i=0;i<n;i++) dv.setInt16(44+i*2,int16[i],true);
+        return new Blob([buf],{type:"audio/wav"});
+      }
       async function doSpeak(){
         var text=sentenceEl.classList.contains("placeholder")?"":sentenceEl.textContent.trim();
         if(!text){ err.textContent="Speak or type a sentence first."; return; }
         err.textContent=""; $("playBtn").disabled=true; setOrb("thinking");
+        var ctx=getCtx(); if(ctx.state==="suspended"){ try{ await ctx.resume(); }catch(e){} }
         try{
           var r=await fetch("/api/speak",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:text,from:fromLang,to:tgtLang})});
-          var d=await r.json(); if(d.error)throw new Error(d.error);
-          lastAudio="data:audio/wav;base64,"+d.audio_base64;
-          audioEl.src=lastAudio; audioEl.play().catch(function(){setOrb("standby");});
+          if(!r.ok||!r.body){ var ed={}; try{ ed=await r.json(); }catch(_){} throw new Error(ed.error||("HTTP "+r.status)); }
+          var sr=parseInt(r.headers.get("X-Sample-Rate")||"24000",10);
+          var reader=r.body.getReader();
+          var leftover=new Uint8Array(0), nextTime=0, started=false, pcmParts=[];
+          function schedule(int16){
+            if(!int16.length) return;
+            pcmParts.push(int16);
+            var f=new Float32Array(int16.length);
+            for(var i=0;i<int16.length;i++) f[i]=int16[i]/32768;
+            var b=ctx.createBuffer(1,f.length,sr); b.copyToChannel(f,0);
+            var node=ctx.createBufferSource(); node.buffer=b; node.connect(ctx.destination);
+            var t=Math.max(ctx.currentTime+0.04,nextTime);
+            node.start(t); nextTime=t+b.duration;
+            if(!started){ started=true; setOrb("speaking"); $("listenAgain").hidden=false; }
+          }
+          for(;;){
+            var rd=await reader.read();
+            if(rd.done) break;
+            var chunk=rd.value;
+            var merged=new Uint8Array(leftover.length+chunk.length);
+            merged.set(leftover,0); merged.set(chunk,leftover.length);
+            var usable=merged.length-(merged.length%2);
+            if(usable>0){
+              var view=new Int16Array(merged.buffer,merged.byteOffset,usable/2);
+              schedule(Int16Array.from(view));    // copy out before reusing the byte buffer
+            }
+            leftover=merged.slice(usable);
+          }
+          // assemble the full clip for "Listen Again"
+          var totalLen=0; pcmParts.forEach(function(p){ totalLen+=p.length; });
+          var all=new Int16Array(totalLen), off=0; pcmParts.forEach(function(p){ all.set(p,off); off+=p.length; });
+          if(lastAudio&&lastAudio.indexOf("blob:")===0) URL.revokeObjectURL(lastAudio);
+          lastAudio=URL.createObjectURL(pcmToWavBlob(all,sr));
+          if(!started){ setOrb("standby"); err.textContent="No audio produced."; }
+          else { var ms=Math.max(0,(nextTime-ctx.currentTime)*1000); setTimeout(function(){ setOrb("standby"); }, ms+100); }
         }catch(e){ err.textContent="Error: "+e.message; setOrb("standby"); }
         finally{ $("playBtn").disabled=false; }
       }
