@@ -96,7 +96,12 @@ const THREADS = Math.min(os.cpus().length, 8);
 // -27 LUFS normalization and produced saturated, "glued to the mic" audio. SDK-level
 // sentenceStream still streams per sentence (~1.1s first-audio), so playback stays
 // progressive without the saturation.
-const TTS_STREAM_CFG = { threads: THREADS, kvCacheType: "f16" };
+// streamChunkTokens enables the engine's native chunk-streaming (first audio out after
+// ~streamFirstChunkTokens tokens instead of after the whole first sentence -> lower latency).
+// It saturated audio on 0.2.x (skipped loudness normalization); the SDK team fixed that
+// normalization in tts-ggml 0.3.x, verified clean here (peak ~26% FS). streamFirstChunkTokens
+// small = fastest first-audio; streamChunkTokens ~= 1s/chunk.
+const TTS_STREAM_CFG = { threads: THREADS, kvCacheType: "f16", streamChunkTokens: 25, streamFirstChunkTokens: 10 };
 const TTS_LRU_MAX = 2;   // keep up to 2 reference-matched TTS models resident (RAM-gated)
 // Synthesis MUST go through sentenceStream: @qvac/tts-ggml 0.2.x (SDK 0.13.x) runs
 // away to a fixed ~40s of babble when a multi-sentence string (~>100 graphemes) is
@@ -298,12 +303,19 @@ async function prewarmTts(id) {
 function defaultTargetFor(fromLang) {
   return Object.keys(TTS_LANGS).find((l) => l !== fromLang) || "en";
 }
-function warmActiveVoice() {
+// Warm the active voice for a SPECIFIC target language (driven by the client via /api/warm
+// when the user picks a target). Pre-loading the RIGHT language during the user's typing
+// window makes the first speak fast (~0.7s) instead of paying the multi-second model load
+// then. We do NOT guess a language on enroll/select anymore: a wrong guess just blocked the
+// real first request (serialized) without helping. Serialized so it never races another op.
+function warmVoiceLang(lang) {
   const v = store.voices.find((x) => x.id === store.activeId);
-  if (!v) return;
-  const lang = defaultTargetFor(v.lang || "en");
-  // Serialize the warm so its load+prewarm never overlaps a real request (0.3.x GPU SIGSEGVs on overlap).
-  serializeWorker(() => ensureTts(lang).then(prewarmTts)).catch((e) => log(`warm skipped: ${e.message}`));
+  if (!v || !lang || !TTS_LANGS[lang]) return;
+  const from = v.lang || "en";
+  // Warm the TTS model AND the translation model (if a cross-language pair) so the first
+  // speak pays neither load. Serialized so it never races another worker op.
+  serializeWorker(() => ensureTts(lang).then(prewarmTts)).catch((e) => log(`warm tts skipped: ${e.message}`));
+  if (from !== lang) serializeWorker(() => ensureNmt(from, lang)).catch((e) => log(`warm nmt skipped: ${e.message}`));
 }
 
 // ---------- audio helpers ----------
@@ -465,8 +477,7 @@ const server = http.createServer(async (req, res) => {
         store.voices.unshift(voice);
         store.activeId = id;
         saveStore();
-        await dropTts();   // new active voice -> next speak loads it
-        warmActiveVoice();  // begin loading + priming in the background
+        await dropTts();   // new active voice -> the client warms the chosen target via /api/warm
         log(`Voice enrolled: "${name}" (${(buf.length / 1024).toFixed(0)} KB).`);
         return send(res, 200, { voice: publicVoice(voice), activeId: store.activeId });
       } finally { try { if (existsSync(inPath)) unlinkSync(inPath); } catch {} }
@@ -476,8 +487,17 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && pathOnly === "/api/voices/select") {
       const { id } = JSON.parse((await readBody(req)).toString() || "{}");
       if (!store.voices.find((v) => v.id === id)) return send(res, 404, { error: "Voice not found." });
-      if (store.activeId !== id) { store.activeId = id; saveStore(); await dropTts(); warmActiveVoice(); }
+      if (store.activeId !== id) { store.activeId = id; saveStore(); await dropTts(); }
       return send(res, 200, { ok: true, activeId: store.activeId });
+    }
+
+    // Pre-warm the active voice for a target language (fire-and-forget). The client calls this
+    // when the user picks/changes the target language so the model is loaded before they speak.
+    if (req.method === "POST" && pathOnly === "/api/warm") {
+      let lang = "";
+      try { lang = (JSON.parse((await readBody(req)).toString() || "{}").lang || "").toString().toLowerCase(); } catch {}
+      warmVoiceLang(lang);   // serialized + deduped; returns immediately
+      return send(res, 200, { ok: true, warming: lang || null });
     }
 
     // Clear ALL voices (entries + audio files). Used on page load so a reload forces a fresh re-record.

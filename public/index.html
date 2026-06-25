@@ -384,6 +384,9 @@
 
       // ===================== STATE =====================
       function paintTo(){ $("toDD").innerHTML=IC.translate+'<span>'+esc(ttsLangs[tgtLang]||tgtLang.toUpperCase())+'</span>'+IC.chevron; }
+      // Pre-load the TTS model for the selected target language so the first speak is fast
+      // (the model load is the slow part; warming it during the typing window hides it).
+      function warmTarget(){ if(tgtLang) fetch("/api/warm",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({lang:tgtLang})}).catch(function(){}); }
       async function refreshState(){
         try{
           var st=await (await fetch("/api/state")).json();
@@ -412,7 +415,7 @@
         // Never offer the cloned voice's own language as an output target: the point is
         // to hear your voice in ANOTHER language (and same-lang would just re-read the input).
         var items=Object.keys(ttsLangs).filter(function(c){return c!==fromLang;}).map(function(c){return {label:ttsLangs[c],code:c,sel:c===tgtLang};});
-        popup($("toDD"),items,function(it){ tgtLang=it.code; paintTo(); });
+        popup($("toDD"),items,function(it){ tgtLang=it.code; paintTo(); warmTarget(); });
       });
       // ===================== MAIN: speak / translate =====================
       var sentenceEl=$("sentence");
@@ -537,6 +540,7 @@
           closeModal("cloneModal");
           if(!$("app").classList.contains("show")) enterApp(); else await refreshState();
           setOrb("standby");
+          warmTarget();   // pre-load the chosen target language so the first speak is fast
         }catch(e){ err.textContent="Error: "+e.message; $("cloneStatus").textContent="Listening..."; $("cloneDone").disabled=false; setOrb("standby"); }
       }
 
