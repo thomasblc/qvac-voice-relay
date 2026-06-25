@@ -102,7 +102,13 @@ const THREADS = Math.min(os.cpus().length, 8);
 // normalization in tts-ggml 0.3.x, verified clean here (peak ~26% FS). streamFirstChunkTokens
 // small = fastest first-audio; streamChunkTokens ~= 1s/chunk.
 const TTS_STREAM_CFG = { threads: THREADS, kvCacheType: "f16", streamChunkTokens: 25, streamFirstChunkTokens: 10 };
-const TTS_LRU_MAX = 2;   // keep up to 2 reference-matched TTS models resident (RAM-gated)
+// Languages the demo switches between: pre-warmed in the background on enroll and kept
+// resident so EVERY language switch is instant (each output language is a separate model
+// whose first load is ~5s). Measured: 5 chatterbox models fit resident on this Mac (~1.8GB
+// each). Override with TTS_WARM_LANGS="en,fr,it" to match your demo's exact set.
+const TTS_WARM_LANGS = (process.env.TTS_WARM_LANGS || "en,es,fr,it,de").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+// LRU must hold the whole warm set (+1 spare) or warming the last would evict the first.
+const TTS_LRU_MAX = Math.max(2, TTS_WARM_LANGS.length + 1);
 // Synthesis MUST go through sentenceStream: @qvac/tts-ggml 0.2.x (SDK 0.13.x) runs
 // away to a fixed ~40s of babble when a multi-sentence string (~>100 graphemes) is
 // fed as a single utterance. runStream splits on sentence boundaries (merged up to
@@ -317,6 +323,17 @@ function warmVoiceLang(lang) {
   serializeWorker(() => ensureTts(lang).then(prewarmTts)).catch((e) => log(`warm tts skipped: ${e.message}`));
   if (from !== lang) serializeWorker(() => ensureNmt(from, lang)).catch((e) => log(`warm nmt skipped: ${e.message}`));
 }
+// Pre-warm the whole demo language set (background) so switching between them is instant.
+// `priority` (the client's currently-selected target) is warmed FIRST so the first speak is
+// ready before the rest of the set loads. Skips the voice's own clone language (not a target).
+function warmDemoSet(priority) {
+  const v = store.voices.find((x) => x.id === store.activeId);
+  if (!v) return;
+  const from = v.lang || "en";
+  const order = [priority, ...TTS_WARM_LANGS].filter((l, i, a) => l && TTS_LANGS[l] && l !== from && a.indexOf(l) === i);
+  if (order.length) log(`Warming demo set: ${order.join(", ")}`);
+  for (const lang of order) warmVoiceLang(lang);
+}
 
 // ---------- audio helpers ----------
 function toWav16k(inputPath, outputPath) {
@@ -496,7 +513,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && pathOnly === "/api/warm") {
       let lang = "";
       try { lang = (JSON.parse((await readBody(req)).toString() || "{}").lang || "").toString().toLowerCase(); } catch {}
-      warmVoiceLang(lang);   // serialized + deduped; returns immediately
+      warmDemoSet(lang);   // priority lang first, then the rest of the demo set; serialized + deduped
       return send(res, 200, { ok: true, warming: lang || null });
     }
 
