@@ -379,14 +379,21 @@
 
       function enterApp(){
         $("onboard").classList.add("hidden"); $("app").classList.add("show");
-        refreshState();
+        return refreshState();
       }
 
       // ===================== STATE =====================
       function paintTo(){ $("toDD").innerHTML=IC.translate+'<span>'+esc(ttsLangs[tgtLang]||tgtLang.toUpperCase())+'</span>'+IC.chevron; }
       // Pre-load the TTS model for the selected target language so the first speak is fast
       // (the model load is the slow part; warming it during the typing window hides it).
-      function warmTarget(){ if(tgtLang) fetch("/api/warm",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({lang:tgtLang})}).catch(function(){}); }
+      var lastWarmKey="";
+      function warmTarget(){
+        if(!tgtLang||!activeVoice) return;
+        var key=activeVoice.id+"|"+tgtLang;
+        if(key===lastWarmKey) return;
+        lastWarmKey=key;
+        fetch("/api/warm",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({lang:tgtLang})}).catch(function(){ if(lastWarmKey===key) lastWarmKey=""; });
+      }
       async function refreshState(){
         try{
           var st=await (await fetch("/api/state")).json();
@@ -538,7 +545,7 @@
           var r=await fetch("/api/enroll",{method:"POST",headers:{"Content-Type":"application/octet-stream","X-Consent":"yes","X-Voice-Name":encodeURIComponent(""),"X-Voice-Lang":cloneLang},body:await blob.arrayBuffer()});
           var d=await r.json(); if(d.error)throw new Error(d.error);
           closeModal("cloneModal");
-          if(!$("app").classList.contains("show")) enterApp(); else await refreshState();
+          if(!$("app").classList.contains("show")) await enterApp(); else await refreshState();
           setOrb("standby");
           warmTarget();   // pre-load the chosen target language so the first speak is fast
         }catch(e){ err.textContent="Error: "+e.message; $("cloneStatus").textContent="Listening..."; $("cloneDone").disabled=false; setOrb("standby"); }

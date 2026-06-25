@@ -102,11 +102,11 @@ const THREADS = Math.min(os.cpus().length, 8);
 // normalization in tts-ggml 0.3.x, verified clean here (peak ~26% FS). streamFirstChunkTokens
 // small = fastest first-audio; streamChunkTokens ~= 1s/chunk.
 const TTS_STREAM_CFG = { threads: THREADS, kvCacheType: "f16", streamChunkTokens: 25, streamFirstChunkTokens: 10 };
-// Languages the demo switches between: pre-warmed in the background on enroll and kept
-// resident so EVERY language switch is instant (each output language is a separate model
-// whose first load is ~5s). Measured: 5 chatterbox models fit resident on this Mac (~1.8GB
-// each). Override with TTS_WARM_LANGS="en,fr,it" to match your demo's exact set.
+// Optional demo-mode warm set. Warming every language hides later language switches, but it
+// also queues many multi-second TTS loads behind the single serialized worker. Keep it opt-in
+// so a normal first speak only pays for the selected target language.
 const TTS_WARM_LANGS = (process.env.TTS_WARM_LANGS || "en,es,fr,it,de").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+const TTS_PREWARM_DEMO_SET = /^(1|true|yes)$/i.test(process.env.TTS_PREWARM_DEMO_SET || "");
 // LRU must hold the whole warm set (+1 spare) or warming the last would evict the first.
 const TTS_LRU_MAX = Math.max(2, TTS_WARM_LANGS.length + 1);
 // Synthesis MUST go through sentenceStream: @qvac/tts-ggml 0.2.x (SDK 0.13.x) runs
@@ -171,6 +171,8 @@ const nmtCache = new Map();       // `${from}|${to}` -> modelId
 const ttsCache = new Map();       // key -> modelId  (insertion order = LRU order)
 const ttsLoading = new Map();     // key -> Promise<modelId>  (dedupe concurrent loads)
 const ttsWarmed = new Set();      // modelIds already primed with a throwaway synth
+const ttsWarmQueued = new Set();  // `${ref}|${lang}` warm jobs already queued
+const nmtWarmQueued = new Set();  // `${from}|${to}` warm jobs already queued
 
 // ---------- download-progress broadcast (SSE) ----------
 // The SDK downloads model weights on first use (into ~/.qvac). We surface that
@@ -206,6 +208,7 @@ async function dropTts() {
     ttsWarmed.delete(id);
   }
   ttsCache.clear();
+  ttsWarmQueued.clear();
 }
 
 async function ensureWhisper(lang) {
@@ -280,6 +283,7 @@ async function ensureTts(lang) {
       const oldId = ttsCache.get(oldKey);
       ttsCache.delete(oldKey);
       ttsWarmed.delete(oldId);
+      ttsWarmQueued.delete(oldKey);
       try { await unloadModel({ modelId: oldId, clearStorage: false }); } catch (e) {}
       log(`Evicted TTS model (LRU): ${oldKey}`);
     }
@@ -320,8 +324,29 @@ function warmVoiceLang(lang) {
   const from = v.lang || "en";
   // Warm the TTS model AND the translation model (if a cross-language pair) so the first
   // speak pays neither load. Serialized so it never races another worker op.
-  serializeWorker(() => ensureTts(lang).then(prewarmTts)).catch((e) => log(`warm tts skipped: ${e.message}`));
-  if (from !== lang) serializeWorker(() => ensureNmt(from, lang)).catch((e) => log(`warm nmt skipped: ${e.message}`));
+  const ref = activeRefPath();
+  if (ref && existsSync(ref)) {
+    const ttsKey = `${ref}|${lang}`;
+    const cachedTtsId = ttsCache.get(ttsKey);
+    if (!(cachedTtsId && ttsWarmed.has(cachedTtsId)) && !ttsWarmQueued.has(ttsKey)) {
+      ttsWarmQueued.add(ttsKey);
+      serializeWorker(async () => {
+        try {
+          if (activeRefPath() !== ref) return; // active voice changed before this warm ran
+          await prewarmTts(await ensureTts(lang));
+        } finally {
+          ttsWarmQueued.delete(ttsKey);
+        }
+      }).catch((e) => log(`warm tts skipped: ${e.message}`));
+    }
+  }
+  if (from !== lang) {
+    const nmtKey = `${from}|${lang}`;
+    if (!nmtCache.has(nmtKey) && !nmtWarmQueued.has(nmtKey)) {
+      nmtWarmQueued.add(nmtKey);
+      serializeWorker(() => ensureNmt(from, lang).finally(() => nmtWarmQueued.delete(nmtKey))).catch((e) => log(`warm nmt skipped: ${e.message}`));
+    }
+  }
 }
 // Pre-warm the whole demo language set (background) so switching between them is instant.
 // `priority` (the client's currently-selected target) is warmed FIRST so the first speak is
@@ -513,7 +538,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && pathOnly === "/api/warm") {
       let lang = "";
       try { lang = (JSON.parse((await readBody(req)).toString() || "{}").lang || "").toString().toLowerCase(); } catch {}
-      warmDemoSet(lang);   // priority lang first, then the rest of the demo set; serialized + deduped
+      if (TTS_PREWARM_DEMO_SET) warmDemoSet(lang);
+      else warmVoiceLang(lang);
       return send(res, 200, { ok: true, warming: lang || null });
     }
 
