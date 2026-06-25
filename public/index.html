@@ -454,10 +454,9 @@
       });
 
       // ---- streaming playback via Web Audio ----
-      // The server streams raw Int16LE PCM as the engine produces it; we schedule
-      // each piece back-to-back on an AudioContext so audio starts within a few
-      // hundred ms instead of waiting for the whole utterance to synthesize.
+      // The server sends raw Int16LE PCM; schedule the received buffer through Web Audio.
       var audioCtx=null;
+      var START_MARGIN_SECONDS=0.12;
       function getCtx(){ if(!audioCtx) audioCtx=new (window.AudioContext||window.webkitAudioContext)(); return audioCtx; }
       function pcmToWavBlob(int16,sr){
         var n=int16.length, buf=new ArrayBuffer(44+n*2), dv=new DataView(buf);
@@ -487,7 +486,7 @@
             for(var i=0;i<int16.length;i++) f[i]=int16[i]/32768;
             var b=ctx.createBuffer(1,f.length,sr); b.copyToChannel(f,0);
             var node=ctx.createBufferSource(); node.buffer=b; node.connect(ctx.destination);
-            var t=Math.max(ctx.currentTime+0.04,nextTime);
+            var t=Math.max(ctx.currentTime+START_MARGIN_SECONDS,nextTime);
             node.start(t); nextTime=t+b.duration;
             if(!started){ started=true; setOrb("speaking"); $("listenAgain").hidden=false; }
           }

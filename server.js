@@ -92,16 +92,9 @@ const THREADS = Math.min(os.cpus().length, 8);
 //  - kvCacheType "f16": tts-ggml 0.3.x defaults the KV cache to q8_0, which CRASHES the
 //    Metal/GPU path ("unsupported op 'CONT'" -> SIGABRT). f16 fixes it (SDK team / Max,
 //    2026-06-24). Tiny memory cost for this model.
-// We DO NOT enable engine chunk-streaming (streamChunkTokens): on 0.2.x it skipped the
-// -27 LUFS normalization and produced saturated, "glued to the mic" audio. SDK-level
-// sentenceStream still streams per sentence (~1.1s first-audio), so playback stays
-// progressive without the saturation.
-// streamChunkTokens enables the engine's native chunk-streaming (first audio out after
-// ~streamFirstChunkTokens tokens instead of after the whole first sentence -> lower latency).
-// It saturated audio on 0.2.x (skipped loudness normalization); the SDK team fixed that
-// normalization in tts-ggml 0.3.x, verified clean here (peak ~26% FS). streamFirstChunkTokens
-// small = fastest first-audio; streamChunkTokens ~= 1s/chunk.
-const TTS_STREAM_CFG = { threads: THREADS, kvCacheType: "f16", streamChunkTokens: 25, streamFirstChunkTokens: 10 };
+// Do not enable native chunk streaming by default. We generate a complete utterance before
+// sending it to the browser so playback is continuous instead of dependent on burst timing.
+const TTS_STREAM_CFG = { threads: THREADS, kvCacheType: "f16" };
 // Optional demo-mode warm set. Warming every language hides later language switches, but it
 // also queues many multi-second TTS loads behind the single serialized worker. Keep it opt-in
 // so a normal first speak only pays for the selected target language.
@@ -109,21 +102,12 @@ const TTS_WARM_LANGS = (process.env.TTS_WARM_LANGS || "en,es,fr,it,de").split(",
 const TTS_PREWARM_DEMO_SET = /^(1|true|yes)$/i.test(process.env.TTS_PREWARM_DEMO_SET || "");
 // LRU must hold the whole warm set (+1 spare) or warming the last would evict the first.
 const TTS_LRU_MAX = Math.max(2, TTS_WARM_LANGS.length + 1);
-// Synthesis MUST go through sentenceStream: @qvac/tts-ggml 0.2.x (SDK 0.13.x) runs
-// away to a fixed ~40s of babble when a multi-sentence string (~>100 graphemes) is
-// fed as a single utterance. runStream splits on sentence boundaries (merged up to
-// this many graphemes per chunk) so each chunk stays under the runaway threshold.
-const TTS_MAX_CHUNK_SCALARS = 80;
-// Pace fix: Chatterbox MTL rushes (~200 wpm) regardless of the reference. tts-ggml 0.3.x
-// adds a NATIVE `speed` knob (pitch-preserving WSOLA time-stretch) which replaces the old
-// ffmpeg `atempo` pipe. speed < 1 = slower. It is a LOAD-time modelConfig param, so it is
-// baked per (voice, language) model in ensureTts. The comfortable factor differs per output
-// language (word length / felt rate), tuned by ear. 1.0 = no slowdown. Env TTS_SPEED overrides.
+// Pace control is a post-synthesis WSOLA time-stretch. It improves speaking rate, but can
+// add artifacts, so default to raw model speed for quality. Env TTS_SPEED=0.85 can re-enable
+// the old slowdown if the output feels too rushed.
 const TTS_SPEED_BY_LANG = {
-  en: 0.78,   // validated by ear (raw ~200 wpm -> ~166 wpm)
-  it: 0.85,   // validated by ear (0.78 felt too slow in Italian)
 };
-const TTS_SPEED_DEFAULT = 0.85;
+const TTS_SPEED_DEFAULT = 1.0;
 const TTS_SPEED_OVERRIDE = process.env.TTS_SPEED ? Number(process.env.TTS_SPEED) : null;
 const speedFor = (lang) => TTS_SPEED_OVERRIDE != null ? TTS_SPEED_OVERRIDE : (TTS_SPEED_BY_LANG[lang] ?? TTS_SPEED_DEFAULT);
 const log = (m) => console.log(m);
@@ -302,9 +286,9 @@ async function prewarmTts(id) {
   try {
     const out = textToSpeech({
       modelId: id, text: "ok", inputType: "text",
-      stream: true, sentenceStream: true, sentenceStreamMaxChunkScalars: TTS_MAX_CHUNK_SCALARS,
+      stream: false,
     });
-    for await (const _ of out.bufferStream) { /* drain */ }
+    await out.buffer;
   } catch (e) { ttsWarmed.delete(id); }
 }
 
@@ -620,36 +604,25 @@ const server = http.createServer(async (req, res) => {
         log(`Speak: "${text.slice(0, 40)}" (${from}) -> "${translated.slice(0, 40)}" (${to})`);
 
         const ttsId = await ensureTts(to);
+        // Pace is applied by the engine at load time. Generate the full utterance before
+        // responding so the browser plays one continuous buffer without stream underruns.
+        const t0 = process.hrtime.bigint();
+        const out = textToSpeech({
+          modelId: ttsId, text: translated, inputType: "text",
+          stream: false,
+        });
+        const samples = Array.from(await out.buffer);
+        const synthMs = Number(process.hrtime.bigint() - t0) / 1e6;
+        const trimmed = trimTrailing(samples, CHATTERBOX_SR);
         res.writeHead(200, {
           "Content-Type": "application/octet-stream",
           "Cache-Control": "no-store",
           "X-Sample-Rate": String(CHATTERBOX_SR),
           "X-Translated": encodeURIComponent(translated),
         });
-
-        // Pace is applied natively by the engine (load-time `speed` in ensureTts), so the
-        // streamed PCM is already at the comfortable rate -> just stream it straight through.
-        const out = textToSpeech({
-          modelId: ttsId, text: translated, inputType: "text",
-          stream: true, sentenceStream: true, sentenceStreamMaxChunkScalars: TTS_MAX_CHUNK_SCALARS,
-        });
-        const FRAME = Math.floor(CHATTERBOX_SR * 0.2);     // flush ~200ms at a time
-        const HOLDBACK = Math.floor(CHATTERBOX_SR * 0.5);  // hold last ~0.5s for trailing trim (keeps first-audio low)
-        const t0 = process.hrtime.bigint();
-        let firstMs = -1, total = 0;
-        let pending = [];
-        for await (const s of out.bufferStream) {
-          if (firstMs < 0) firstMs = Number(process.hrtime.bigint() - t0) / 1e6;
-          pending.push(s); total++;
-          if (pending.length > HOLDBACK + FRAME) {
-            writeInt16(res, pending.splice(0, pending.length - HOLDBACK));
-          }
-        }
-        const tail = trimTrailing(pending, CHATTERBOX_SR);
-        writeInt16(res, tail);
+        writeInt16(res, trimmed);
         res.end();
-        const trimmedTotal = total - (pending.length - tail.length);
-        log(`TTS stream: first-audio ${firstMs.toFixed(0)}ms, ${trimmedTotal} samples (${(trimmedTotal / CHATTERBOX_SR).toFixed(2)}s) speed=${speedFor(to)} (${to})`);
+        log(`TTS full: synth ${synthMs.toFixed(0)}ms, ${trimmed.length} samples (${(trimmed.length / CHATTERBOX_SR).toFixed(2)}s) speed=${speedFor(to)} (${to})`);
       });
       return;
     }
