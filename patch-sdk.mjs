@@ -4,20 +4,22 @@
 // patches are idempotent and re-apply cleanly after an `npm install` (which
 // restores the original files). server.js runs patchSdk() automatically.
 //
-// What is patched — Chatterbox streaming/perf knobs: the SDK's chatterbox plugin
-// only forwards `language` + `useGPU` to the @qvac/tts-ggml engine and its load
-// schema is `.strict()` (rejects unknown keys). The engine itself accepts
-// `streamChunkTokens`, `streamFirstChunkTokens`, `cfmSteps`, `threads`, and
-// `nGpuLayers` — needed for low-latency chunk streaming and the 1-step CFM
-// speedup. We (a) allow these keys in the schema and (b) forward them in
-// createChatterboxModel. Tracked for upstream in the SDK 0.14.0 ticket; remove
-// this script once those knobs are exposed natively.
+// What is patched — Chatterbox knobs the SDK's chatterbox plugin does NOT forward:
+// it only passes `language` + `useGPU` to the @qvac/tts-ggml engine, and its load
+// schema is `.strict()` (rejects unknown keys). The engine itself accepts extra
+// knobs (streaming/perf, plus `speed` and `kvCacheType` on tts-ggml 0.3.x). We
+// (a) allow these keys in the schema and (b) forward them in createChatterboxModel.
+// NOTE: `kvCacheType` is a STRING ('f16'|'f32'|'q8_0'); on tts-ggml 0.3.x the q8_0
+// default crashes the Metal path ("unsupported op 'CONT'"), so f16 is the fix there.
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 
-// Extra chatterbox modelConfig knobs to allow + forward (schema + plugin).
-const KNOBS = ["streamChunkTokens", "streamFirstChunkTokens", "cfmSteps", "threads", "nGpuLayers", "seed"];
+// Number-valued chatterbox modelConfig knobs to allow + forward.
+const NUM_KNOBS = ["streamChunkTokens", "streamFirstChunkTokens", "cfmSteps", "threads", "nGpuLayers", "seed", "speed", "nCtx"];
+// String-valued knobs (separate so the schema uses z.string()).
+const STR_KNOBS = ["kvCacheType"];
+const ALL_KNOBS = [...NUM_KNOBS, ...STR_KNOBS];
 
 // Robustly locate the installed SDK's dist/ dir. (The previous implementation
 // used main.indexOf("@qvac/sdk"), which fails on Windows because require.resolve
@@ -42,9 +44,12 @@ function patchTtsSchemaKnobs(dist) {
   const re = /(export const ttsChatterboxRuntimeConfigSchema = z\.object\(\{[\s\S]*?useGPU: z\.boolean\(\)\.optional\(\),\n)(\}\);)/;
   if (!re.test(src)) { console.error("[patch-sdk] ttsChatterboxRuntimeConfigSchema block not found; SDK layout changed."); return false; }
 
-  const knobLines = KNOBS.map((k) => `    ${k}: z.number().optional(),`).join("\n") + "\n";
+  const knobLines = [
+    ...NUM_KNOBS.map((k) => `    ${k}: z.number().optional(),`),
+    ...STR_KNOBS.map((k) => `    ${k}: z.string().optional(),`),
+  ].join("\n") + "\n";
   writeFileSync(file, src.replace(re, `$1${knobLines}$2`));
-  console.log(`[patch-sdk] patched schema to allow ${KNOBS.length} chatterbox knobs.`);
+  console.log(`[patch-sdk] patched schema to allow ${ALL_KNOBS.length} chatterbox knobs.`);
   return true;
 }
 
@@ -58,11 +63,11 @@ function patchChatterboxPlugin(dist) {
   const anchor = `        files: { t3Model, s3genModel },\n`;
   if (!src.includes(anchor)) { console.error("[patch-sdk] createChatterboxModel anchor not found; SDK layout changed."); return false; }
 
-  const forward = KNOBS.map(
+  const forward = ALL_KNOBS.map(
     (k) => `        ...(config.${k} !== undefined ? { ${k}: config.${k} } : {}),\n`
   ).join("");
   writeFileSync(file, src.replace(anchor, anchor + forward));
-  console.log(`[patch-sdk] patched plugin to forward ${KNOBS.length} chatterbox knobs.`);
+  console.log(`[patch-sdk] patched plugin to forward ${ALL_KNOBS.length} chatterbox knobs.`);
   return true;
 }
 

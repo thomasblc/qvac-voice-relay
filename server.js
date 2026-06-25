@@ -87,15 +87,34 @@ const BERGAMOT = {
 const CHATTERBOX_SR = 24000;
 // Engine threads: tts-ggml caps its own default at 4; on bigger boxes we lift it.
 const THREADS = Math.min(os.cpus().length, 8);
-// Native chunk-streaming + 1-step CFM knobs (forwarded to @qvac/tts-ggml via patch-sdk.mjs).
-// streamFirstChunkTokens kept small for low first-audio-out; streamChunkTokens ~= 1s/chunk.
-const TTS_STREAM_CFG = { streamChunkTokens: 25, streamFirstChunkTokens: 10, cfmSteps: 1, threads: THREADS };
+// TTS engine config (tts-ggml 0.3.x via package.json override + patch-sdk forwarding):
+//  - threads: lift the engine's default cap of 4 on bigger boxes.
+//  - kvCacheType "f16": tts-ggml 0.3.x defaults the KV cache to q8_0, which CRASHES the
+//    Metal/GPU path ("unsupported op 'CONT'" -> SIGABRT). f16 fixes it (SDK team / Max,
+//    2026-06-24). Tiny memory cost for this model.
+// We DO NOT enable engine chunk-streaming (streamChunkTokens): on 0.2.x it skipped the
+// -27 LUFS normalization and produced saturated, "glued to the mic" audio. SDK-level
+// sentenceStream still streams per sentence (~1.1s first-audio), so playback stays
+// progressive without the saturation.
+const TTS_STREAM_CFG = { threads: THREADS, kvCacheType: "f16" };
 const TTS_LRU_MAX = 2;   // keep up to 2 reference-matched TTS models resident (RAM-gated)
 // Synthesis MUST go through sentenceStream: @qvac/tts-ggml 0.2.x (SDK 0.13.x) runs
 // away to a fixed ~40s of babble when a multi-sentence string (~>100 graphemes) is
 // fed as a single utterance. runStream splits on sentence boundaries (merged up to
 // this many graphemes per chunk) so each chunk stays under the runaway threshold.
 const TTS_MAX_CHUNK_SCALARS = 80;
+// Pace fix: Chatterbox MTL rushes (~200 wpm) regardless of the reference. tts-ggml 0.3.x
+// adds a NATIVE `speed` knob (pitch-preserving WSOLA time-stretch) which replaces the old
+// ffmpeg `atempo` pipe. speed < 1 = slower. It is a LOAD-time modelConfig param, so it is
+// baked per (voice, language) model in ensureTts. The comfortable factor differs per output
+// language (word length / felt rate), tuned by ear. 1.0 = no slowdown. Env TTS_SPEED overrides.
+const TTS_SPEED_BY_LANG = {
+  en: 0.78,   // validated by ear (raw ~200 wpm -> ~166 wpm)
+  it: 0.85,   // validated by ear (0.78 felt too slow in Italian)
+};
+const TTS_SPEED_DEFAULT = 0.85;
+const TTS_SPEED_OVERRIDE = process.env.TTS_SPEED ? Number(process.env.TTS_SPEED) : null;
+const speedFor = (lang) => TTS_SPEED_OVERRIDE != null ? TTS_SPEED_OVERRIDE : (TTS_SPEED_BY_LANG[lang] ?? TTS_SPEED_DEFAULT);
 const log = (m) => console.log(m);
 
 // ---------- voice store (persistent, multi-voice) ----------
@@ -119,6 +138,19 @@ function activeRefPath() {
 }
 let store = loadStore();
 
+// ---------- worker serialization ----------
+// tts-ggml 0.3.x GPU/Metal SIGSEGVs if two worker operations (loadModel / synth /
+// transcribe / translate) overlap on the single Bare worker (0.2.x tolerated it). We
+// serialize every worker-touching unit (background warm, /api/speak, /api/transcribe)
+// through one promise chain so they can never race. Each call site is a non-nested leaf,
+// so there is no re-entrancy / deadlock. The lock releases on both success and error.
+let workerChain = Promise.resolve();
+function serializeWorker(fn) {
+  const run = workerChain.then(fn, fn);
+  workerChain = run.then(() => {}, () => {});
+  return run;
+}
+
 // ---------- model caches ----------
 const whisperCache = new Map();   // lang -> modelId
 const nmtCache = new Map();       // `${from}|${to}` -> modelId
@@ -137,13 +169,21 @@ function emitProgress(obj) {
   const line = `data: ${JSON.stringify(obj)}\n\n`;
   for (const res of progressClients) { try { res.write(line); } catch {} }
 }
-// Wrap a first-time model load: announce start, stream %, announce done (even on error).
+// Wrap a model load: show the first-run overlay ONLY during a REAL download.
+// Cached loads return instantly and emit no progress (or a lone 100%), so we
+// lazily emit "start" on the first genuine in-progress event (<100%) and skip the
+// overlay entirely otherwise. Without this the overlay flashed on EVERY cached
+// loadModel (app open, mic capture, and before each synthesis).
 async function withProgress(phase, run) {
-  emitProgress({ phase, status: "start" });
+  let started = false;
   try {
-    return await run((p) => { if (p && p.percentage != null) emitProgress({ phase, percentage: p.percentage }); });
+    return await run((p) => {
+      if (!p || p.percentage == null || p.percentage >= 100) return;
+      if (!started) { started = true; emitProgress({ phase, status: "start" }); }
+      emitProgress({ phase, percentage: p.percentage });
+    });
   } finally {
-    emitProgress({ phase, status: "done" });
+    if (started) emitProgress({ phase, status: "done" });
   }
 }
 
@@ -217,6 +257,7 @@ async function ensureTts(lang) {
         s3genModelSrc: TTS_S3GEN_MULTILINGUAL_CHATTERBOX.src,
         referenceAudioSrc: ref,
         useGPU: true,
+        speed: speedFor(lang),   // native pitch-preserving pace (load-time, per language)
         ...TTS_STREAM_CFG,
       },
       onProgress: (p) => { if (p && p.percentage != null) { log(`  chatterbox: ${p.percentage.toFixed(0)}%`); onProgress(p); } },
@@ -261,7 +302,8 @@ function warmActiveVoice() {
   const v = store.voices.find((x) => x.id === store.activeId);
   if (!v) return;
   const lang = defaultTargetFor(v.lang || "en");
-  ensureTts(lang).then(prewarmTts).catch((e) => log(`warm skipped: ${e.message}`));
+  // Serialize the warm so its load+prewarm never overlaps a real request (0.3.x GPU SIGSEGVs on overlap).
+  serializeWorker(() => ensureTts(lang).then(prewarmTts)).catch((e) => log(`warm skipped: ${e.message}`));
 }
 
 // ---------- audio helpers ----------
@@ -477,9 +519,12 @@ const server = http.createServer(async (req, res) => {
       try {
         writeFileSync(inPath, buf);
         await toWav16k(inPath, wavPath);
-        const wId = await ensureWhisper(lang);
-        const raw = await transcribe({ modelId: wId, audioChunk: wavPath });
-        const text = String(raw).replace(/\[[A-Z_ ]+\]/g, "").replace(/\s+/g, " ").trim();
+        // Serialize the STT load+transcribe so it never overlaps another worker op (0.3.x GPU SIGSEGVs on overlap).
+        const text = await serializeWorker(async () => {
+          const wId = await ensureWhisper(lang);
+          const raw = await transcribe({ modelId: wId, audioChunk: wavPath });
+          return String(raw).replace(/\[[A-Z_ ]+\]/g, "").replace(/\s+/g, " ").trim();
+        });
         return send(res, 200, { text });
       } finally { for (const f of [inPath, wavPath]) { try { if (existsSync(f)) unlinkSync(f); } catch {} } }
     }
@@ -496,47 +541,53 @@ const server = http.createServer(async (req, res) => {
       if (!text) return send(res, 400, { error: "text is required" });
       if (!TTS_LANGS[to]) return send(res, 400, { error: `unsupported output language: ${to}` });
 
-      let translated = text;
-      if (from !== to) {
-        const nmtId = await ensureNmt(from, to);
-        const tr = translate({ modelId: nmtId, text, modelType: "nmt", stream: false });
-        // Some Bergamot multilingual models echo a ">>lang<<" target token; strip it so the
-        // voice does not try to read it aloud (e.g. ">>por<< Esta frase..." -> "Esta frase...").
-        translated = String(await tr.text).trim().replace(/^\s*>>[a-z]{2,3}<<\s*/i, "").trim();
-      }
-      log(`Speak: "${text.slice(0, 40)}" (${from}) -> "${translated.slice(0, 40)}" (${to})`);
-
-      // Everything that can fail (translate, model load) happens before headers go out,
-      // so error paths still return clean JSON. Once we start the PCM stream we can only end it.
-      const ttsId = await ensureTts(to);
-      res.writeHead(200, {
-        "Content-Type": "application/octet-stream",
-        "Cache-Control": "no-store",
-        "X-Sample-Rate": String(CHATTERBOX_SR),
-        "X-Translated": encodeURIComponent(translated),
-      });
-
-      const out = textToSpeech({
-        modelId: ttsId, text: translated, inputType: "text",
-        stream: true, sentenceStream: true, sentenceStreamMaxChunkScalars: TTS_MAX_CHUNK_SCALARS,
-      });
-      const FRAME = Math.floor(CHATTERBOX_SR * 0.2);     // flush ~200ms at a time
-      const HOLDBACK = Math.floor(CHATTERBOX_SR * 0.5);  // hold last ~0.5s for trailing trim (keeps first-audio low)
-      const t0 = process.hrtime.bigint();
-      let firstMs = -1, total = 0;
-      let pending = [];
-      for await (const s of out.bufferStream) {
-        if (firstMs < 0) firstMs = Number(process.hrtime.bigint() - t0) / 1e6;
-        pending.push(s); total++;
-        if (pending.length > HOLDBACK + FRAME) {
-          writeInt16(res, pending.splice(0, pending.length - HOLDBACK));
+      // Serialize the whole worker portion (translate + model load + synth stream) so it
+      // never overlaps another worker op (background warm, another request) -> 0.3.x GPU
+      // SIGSEGVs on overlap. The lock is held for the full synth/stream (the worker can only
+      // do one at a time anyway). Errors before headers propagate to the outer 500 handler.
+      await serializeWorker(async () => {
+        let translated = text;
+        if (from !== to) {
+          const nmtId = await ensureNmt(from, to);
+          const tr = translate({ modelId: nmtId, text, modelType: "nmt", stream: false });
+          // Some Bergamot multilingual models echo a ">>lang<<" target token; strip it so the
+          // voice does not try to read it aloud (e.g. ">>por<< Esta frase..." -> "Esta frase...").
+          translated = String(await tr.text).trim().replace(/^\s*>>[a-z]{2,3}<<\s*/i, "").trim();
         }
-      }
-      const tail = trimTrailing(pending, CHATTERBOX_SR);
-      writeInt16(res, tail);
-      res.end();
-      const trimmedTotal = total - (pending.length - tail.length);
-      log(`TTS stream: first-audio ${firstMs.toFixed(0)}ms, ${trimmedTotal} samples (${(trimmedTotal / CHATTERBOX_SR).toFixed(2)}s)`);
+        log(`Speak: "${text.slice(0, 40)}" (${from}) -> "${translated.slice(0, 40)}" (${to})`);
+
+        const ttsId = await ensureTts(to);
+        res.writeHead(200, {
+          "Content-Type": "application/octet-stream",
+          "Cache-Control": "no-store",
+          "X-Sample-Rate": String(CHATTERBOX_SR),
+          "X-Translated": encodeURIComponent(translated),
+        });
+
+        // Pace is applied natively by the engine (load-time `speed` in ensureTts), so the
+        // streamed PCM is already at the comfortable rate -> just stream it straight through.
+        const out = textToSpeech({
+          modelId: ttsId, text: translated, inputType: "text",
+          stream: true, sentenceStream: true, sentenceStreamMaxChunkScalars: TTS_MAX_CHUNK_SCALARS,
+        });
+        const FRAME = Math.floor(CHATTERBOX_SR * 0.2);     // flush ~200ms at a time
+        const HOLDBACK = Math.floor(CHATTERBOX_SR * 0.5);  // hold last ~0.5s for trailing trim (keeps first-audio low)
+        const t0 = process.hrtime.bigint();
+        let firstMs = -1, total = 0;
+        let pending = [];
+        for await (const s of out.bufferStream) {
+          if (firstMs < 0) firstMs = Number(process.hrtime.bigint() - t0) / 1e6;
+          pending.push(s); total++;
+          if (pending.length > HOLDBACK + FRAME) {
+            writeInt16(res, pending.splice(0, pending.length - HOLDBACK));
+          }
+        }
+        const tail = trimTrailing(pending, CHATTERBOX_SR);
+        writeInt16(res, tail);
+        res.end();
+        const trimmedTotal = total - (pending.length - tail.length);
+        log(`TTS stream: first-audio ${firstMs.toFixed(0)}ms, ${trimmedTotal} samples (${(trimmedTotal / CHATTERBOX_SR).toFixed(2)}s) speed=${speedFor(to)} (${to})`);
+      });
       return;
     }
 

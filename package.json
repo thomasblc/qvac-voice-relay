@@ -7,6 +7,9 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "@qvac/sdk": "^0.13.5"
+    "@qvac/sdk": "0.13.5"
+  },
+  "overrides": {
+    "@qvac/tts-ggml": "0.3.5"
   }
 }

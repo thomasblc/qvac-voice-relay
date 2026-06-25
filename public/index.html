@@ -409,7 +409,9 @@
         openPop=p; setTimeout(function(){document.addEventListener("mousedown",onDocDown);},0);
       }
       $("toDD").addEventListener("click",function(){
-        var items=Object.keys(ttsLangs).map(function(c){return {label:ttsLangs[c],code:c,sel:c===tgtLang};});
+        // Never offer the cloned voice's own language as an output target: the point is
+        // to hear your voice in ANOTHER language (and same-lang would just re-read the input).
+        var items=Object.keys(ttsLangs).filter(function(c){return c!==fromLang;}).map(function(c){return {label:ttsLangs[c],code:c,sel:c===tgtLang};});
         popup($("toDD"),items,function(it){ tgtLang=it.code; paintTo(); });
       });
       // ===================== MAIN: speak / translate =====================
