@@ -87,6 +87,10 @@
       .vr-head{display:flex}
       .vr-head .half{flex:1;display:flex;align-items:center;gap:8px;padding:8px 12px}
       .vr-head .half.right{justify-content:flex-start}
+      .vr-head .speed-ctl{justify-content:flex-end}
+      .speed-ctl input[type=range]{-webkit-appearance:none;appearance:none;height:4px;width:110px;border-radius:3px;background:var(--panel);outline:none}
+      .speed-ctl input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:var(--accent);cursor:pointer}
+      .speed-ctl #speedVal{min-width:34px;text-align:right;color:var(--accent)}
       .lbl{font-size:12px;font-weight:500;color:var(--muted)}
       .dd{display:inline-flex;align-items:center;gap:8px;height:36px;padding:8px 12px;border:none;border-radius:var(--r-btn);
         background:transparent;color:var(--text);font-family:inherit;font-size:14px;font-weight:400;cursor:pointer;transition:.12s}
@@ -206,6 +210,7 @@
         <div class="vr-card">
           <div class="vr-head">
             <div class="half right"><span class="lbl">To:</span><button class="dd" id="toDD"></button></div>
+            <div class="half speed-ctl"><span class="lbl">Speed:</span><input type="range" id="speedSlider" min="0.6" max="1" step="0.05" value="1" title="Voice speed (lower = slower). Applies from the next sentence."><span class="lbl" id="speedVal">1.0x</span></div>
           </div>
           <div class="vr-body">
             <div class="vr-left">
@@ -403,8 +408,20 @@
           var keys=Object.keys(ttsLangs);
           if(tgtLang===fromLang||keys.indexOf(tgtLang)<0) tgtLang=keys.find(function(l){return l!==fromLang;})||keys[0]||"en";
           paintTo(); refreshPlaceholder();
+          if(typeof st.speed==="number") setSpeedUI(st.speed);
         }catch(e){}
       }
+      // ---- live voice-speed control ----
+      function setSpeedUI(v){ var s=$("speedSlider"); if(s){ s.value=String(v); } var l=$("speedVal"); if(l){ l.textContent=Number(v).toFixed(2).replace(/0$/,"")+"x"; } }
+      (function(){
+        var s=$("speedSlider"); if(!s) return;
+        s.addEventListener("input",function(){ $("speedVal").textContent=Number(s.value).toFixed(2).replace(/0$/,"")+"x"; });
+        // Commit on release (change) so dragging doesn't spam reloads. Re-warms at the new rate.
+        s.addEventListener("change",function(){
+          fetch("/api/speed",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({speed:Number(s.value)})})
+            .then(function(r){return r.json();}).then(function(d){ if(d&&typeof d.speed==="number"){ setSpeedUI(d.speed); lastWarmKey=""; warmTarget(); } }).catch(function(){});
+        });
+      })();
 
       // ===================== DROPDOWNS =====================
       var openPop=null;

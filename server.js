@@ -109,7 +109,12 @@ const TTS_SPEED_BY_LANG = {
 };
 const TTS_SPEED_DEFAULT = 1.0;
 const TTS_SPEED_OVERRIDE = process.env.TTS_SPEED ? Number(process.env.TTS_SPEED) : null;
-const speedFor = (lang) => TTS_SPEED_OVERRIDE != null ? TTS_SPEED_OVERRIDE : (TTS_SPEED_BY_LANG[lang] ?? TTS_SPEED_DEFAULT);
+// Live, UI-adjustable speaking rate (load-time WSOLA stretch; <1 = slower). Starts from the
+// env override or the default; POST /api/speed changes it live during a demo (resident models
+// are dropped so the next synth reloads at the new rate). Clamped to a sane band.
+let runtimeSpeed = TTS_SPEED_OVERRIDE != null ? TTS_SPEED_OVERRIDE : TTS_SPEED_DEFAULT;
+const clampSpeed = (v) => Math.max(0.5, Math.min(1.2, Number(v) || TTS_SPEED_DEFAULT));
+const speedFor = () => runtimeSpeed;
 const log = (m) => console.log(m);
 
 // ---------- voice store (persistent, multi-voice) ----------
@@ -464,7 +469,21 @@ const server = http.createServer(async (req, res) => {
         activeId: store.activeId,
         ttsLangs: TTS_LANGS,
         sttLangs: Object.keys(STT_WHISPER),
+        speed: runtimeSpeed,
       });
+    }
+
+    // Live speaking-rate control (demo): set the load-time speed; drop resident TTS models so
+    // the next synth reloads at the new rate, then re-warm the current/demo languages.
+    if (req.method === "POST" && pathOnly === "/api/speed") {
+      let v = runtimeSpeed;
+      try { v = clampSpeed(JSON.parse((await readBody(req)).toString() || "{}").speed); } catch {}
+      if (v !== runtimeSpeed) {
+        runtimeSpeed = v;
+        await dropTts();   // models bake speed at load time -> force reload at the new rate
+        log(`Speed set to ${runtimeSpeed} (resident TTS dropped; will reload on next synth).`);
+      }
+      return send(res, 200, { ok: true, speed: runtimeSpeed });
     }
 
     // Capture a "Receive Prototype Link" email -> append to ~/.qvac-voice-relay/emails.json.
