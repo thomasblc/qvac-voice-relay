@@ -379,14 +379,21 @@
 
       function enterApp(){
         $("onboard").classList.add("hidden"); $("app").classList.add("show");
-        refreshState();
+        return refreshState();
       }
 
       // ===================== STATE =====================
       function paintTo(){ $("toDD").innerHTML=IC.translate+'<span>'+esc(ttsLangs[tgtLang]||tgtLang.toUpperCase())+'</span>'+IC.chevron; }
       // Pre-load the TTS model for the selected target language so the first speak is fast
       // (the model load is the slow part; warming it during the typing window hides it).
-      function warmTarget(){ if(tgtLang) fetch("/api/warm",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({lang:tgtLang})}).catch(function(){}); }
+      var lastWarmKey="";
+      function warmTarget(){
+        if(!tgtLang||!activeVoice) return;
+        var key=activeVoice.id+"|"+tgtLang;
+        if(key===lastWarmKey) return;
+        lastWarmKey=key;
+        fetch("/api/warm",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({lang:tgtLang})}).catch(function(){ if(lastWarmKey===key) lastWarmKey=""; });
+      }
       async function refreshState(){
         try{
           var st=await (await fetch("/api/state")).json();
@@ -447,10 +454,9 @@
       });
 
       // ---- streaming playback via Web Audio ----
-      // The server streams raw Int16LE PCM as the engine produces it; we schedule
-      // each piece back-to-back on an AudioContext so audio starts within a few
-      // hundred ms instead of waiting for the whole utterance to synthesize.
+      // The server sends raw Int16LE PCM; schedule the received buffer through Web Audio.
       var audioCtx=null;
+      var START_MARGIN_SECONDS=0.12;
       function getCtx(){ if(!audioCtx) audioCtx=new (window.AudioContext||window.webkitAudioContext)(); return audioCtx; }
       function pcmToWavBlob(int16,sr){
         var n=int16.length, buf=new ArrayBuffer(44+n*2), dv=new DataView(buf);
@@ -480,7 +486,7 @@
             for(var i=0;i<int16.length;i++) f[i]=int16[i]/32768;
             var b=ctx.createBuffer(1,f.length,sr); b.copyToChannel(f,0);
             var node=ctx.createBufferSource(); node.buffer=b; node.connect(ctx.destination);
-            var t=Math.max(ctx.currentTime+0.04,nextTime);
+            var t=Math.max(ctx.currentTime+START_MARGIN_SECONDS,nextTime);
             node.start(t); nextTime=t+b.duration;
             if(!started){ started=true; setOrb("speaking"); $("listenAgain").hidden=false; }
           }
@@ -538,7 +544,7 @@
           var r=await fetch("/api/enroll",{method:"POST",headers:{"Content-Type":"application/octet-stream","X-Consent":"yes","X-Voice-Name":encodeURIComponent(""),"X-Voice-Lang":cloneLang},body:await blob.arrayBuffer()});
           var d=await r.json(); if(d.error)throw new Error(d.error);
           closeModal("cloneModal");
-          if(!$("app").classList.contains("show")) enterApp(); else await refreshState();
+          if(!$("app").classList.contains("show")) await enterApp(); else await refreshState();
           setOrb("standby");
           warmTarget();   // pre-load the chosen target language so the first speak is fast
         }catch(e){ err.textContent="Error: "+e.message; $("cloneStatus").textContent="Listening..."; $("cloneDone").disabled=false; setOrb("standby"); }
