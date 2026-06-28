@@ -890,16 +890,32 @@
       document.querySelectorAll(".overlay").forEach(function(o){ o.addEventListener("mousedown",function(e){ if(e.target===o){ closeModal(o.id); if(o.id==="cloneModal") stopCloneRec(); } }); });
 
       // ---- clone modal ----
-      function openClone(){ cloneLang="en"; showCloneStep(1); paintCloneLang(); openModal("cloneModal"); }
+      function cloneLangs(){ return Object.keys(sttLangs).length?sttLangs:DEFAULT_STT_LANGS; }
+      function normalizeCloneLang(){
+        var langs=cloneLangs();
+        if(langs[cloneLang]) return;
+        cloneLang=langs[fromLang]?fromLang:(langs.en?"en":Object.keys(langs)[0]||"en");
+      }
+      function cloneScriptText(){
+        if(CLONE_SCRIPTS[cloneLang]) return CLONE_SCRIPTS[cloneLang];
+        return "Record a short, natural sample in "+langName(cloneLangs(),cloneLang)+". Speak for about fifteen seconds, using a few clear sentences and a short count from one to five.";
+      }
+      function openClone(){
+        cloneLang=sttLangs[fromLang]?fromLang:"en";
+        showCloneStep(1); paintCloneLang(); openModal("cloneModal");
+        refreshState().then(function(){ normalizeCloneLang(); paintCloneLang(); });
+      }
       function showCloneStep(n){ $("cloneStep1").hidden=n!==1; $("cloneStep2").hidden=n!==2; }
-      function paintCloneLang(){ $("cloneLangDD").innerHTML=IC.translate+'<span>'+esc(LANGNAMES[cloneLang]||cloneLang)+'</span>'+IC.chevron; }
+      function paintCloneLang(){ normalizeCloneLang(); $("cloneLangDD").innerHTML=IC.translate+'<span>'+esc(langName(cloneLangs(),cloneLang))+'</span>'+IC.chevron; }
       $("cloneLangDD").addEventListener("click",function(){
-        var items=Object.keys(LANGNAMES).map(function(c){return {label:LANGNAMES[c],code:c,sel:c===cloneLang};});
+        var langs=cloneLangs();
+        var items=Object.keys(langs).map(function(c){return {label:langName(langs,c),code:c,sel:c===cloneLang};});
         popup($("cloneLangDD"),items,function(it){ cloneLang=it.code; paintCloneLang(); });
       });
       $("cloneBack").addEventListener("click",function(){ stopCloneRec(); showCloneStep(1); });
       $("cloneGo").addEventListener("click",function(){
-        $("cloneScriptText").textContent=CLONE_SCRIPTS[cloneLang]; $("cloneStatus").textContent="Listening..."; $("cloneDone").disabled=false;
+        normalizeCloneLang();
+        $("cloneScriptText").textContent=cloneScriptText(); $("cloneStatus").textContent="Listening..."; $("cloneDone").disabled=false;
         showCloneStep(2); startCloneRec();
       });
       var cloneCtrl=null, cloning=false;
