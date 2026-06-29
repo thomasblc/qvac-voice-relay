@@ -15,11 +15,10 @@
 //
 // Voices persist under ~/.qvac-voice-relay/ (outside the app folder, so this stays packageable to a .app/.dmg).
 //
-// SDK reality (validated 2026-06-05, SDK 0.12.x):
+// SDK reality:
 //   - Chatterbox GGML reference-matched TTS: loadModel({ modelSrc: TTS_T3_MULTILINGUAL_CHATTERBOX_Q8_0.src, modelType:"tts-ggml",
 //       modelConfig:{ ttsEngine:"chatterbox", language, s3genModelSrc: TTS_S3GEN_MULTILINGUAL_CHATTERBOX.src, referenceAudioSrc, useGPU:true } })
 //     referenceAudioSrc AND language are set at LOAD time -> changing voice OR target language requires a reload.
-//     Output languages limited to en/es/de/it (TTS_LANGUAGES). French/Japanese are NOT possible as output voices.
 //   - Parakeet: one shared GGUF transcription model; the selected source language drives translation.
 //   - Translate (Bergamot): modelSrc = BERGAMOT_<FROM>_<TO> (required); non-EN<->non-EN uses modelConfig.pivotModel (pivots via English).
 //   - textToSpeech returns audio samples (Int16-ish), NOT a ready WAV -> wrap with a 24k mono WAV header.
@@ -32,11 +31,6 @@ import { spawn } from "child_process";
 import { createHash, randomUUID } from "crypto";
 import os from "os";
 import path from "path";
-import { patchSdk } from "./patch-sdk.mjs";
-// Forward the chatterbox streaming/perf knobs BEFORE the SDK module evaluates. ESM static
-// imports are hoisted, so the SDK is imported DYNAMICALLY here (after the on-disk patch runs);
-// this also keeps it working after an `npm install` restores the original SDK files.
-patchSdk();
 const qvac = await import("@qvac/sdk");
 const {
   loadModel, unloadModel, transcribe, translate, textToSpeech,
@@ -166,14 +160,8 @@ function requiredModelsFor(from, to) {
 }
 
 const CHATTERBOX_SR = 24000;
-// Engine threads: tts-ggml caps its own default at 4; on bigger boxes we lift it.
+// Worker threads used by Parakeet and Bergamot setup.
 const THREADS = Math.min(os.cpus().length, 8);
-// TTS engine config (tts-ggml 0.3.x via package.json override + patch-sdk forwarding):
-//  - threads: lift the engine's default cap of 4 on bigger boxes.
-//  - kvCacheType "f16": tts-ggml 0.3.x defaults the KV cache to q8_0, which CRASHES the
-//    Metal/GPU path ("unsupported op 'CONT'" -> SIGABRT). f16 fixes it (SDK team / Max,
-//    2026-06-24). Tiny memory cost for this model.
-const TTS_STREAM_CFG = { threads: THREADS, kvCacheType: "f16" };
 const TTS_HTTP_CHUNK_SAMPLES = 2048;
 const TTS_STREAM_LEAD_PAD_SAMPLES = Math.floor(CHATTERBOX_SR * 0.12);
 const TTS_STREAM_TAIL_PAD_SAMPLES = Math.floor(CHATTERBOX_SR * 0.30);
@@ -185,19 +173,6 @@ const TTS_WARM_LANGS = (process.env.TTS_WARM_LANGS || "en,es,fr,it,de").split(",
 const TTS_PREWARM_DEMO_SET = /^(1|true|yes)$/i.test(process.env.TTS_PREWARM_DEMO_SET || "");
 // LRU must hold the whole warm set (+1 spare) or warming the last would evict the first.
 const TTS_LRU_MAX = Math.max(2, TTS_WARM_LANGS.length + 1);
-// Pace control is a post-synthesis WSOLA time-stretch. It improves speaking rate, but can
-// add artifacts, so default to raw model speed for quality. Env TTS_SPEED=0.85 can re-enable
-// the old slowdown if the output feels too rushed.
-const TTS_SPEED_BY_LANG = {
-};
-const TTS_SPEED_DEFAULT = 1.0;
-const TTS_SPEED_OVERRIDE = process.env.TTS_SPEED ? Number(process.env.TTS_SPEED) : null;
-// Live, UI-adjustable speaking rate (load-time WSOLA stretch; <1 = slower). Starts from the
-// env override or the default; POST /api/speed changes it live during a demo (resident models
-// are dropped so the next synth reloads at the new rate). Clamped to a sane band.
-let runtimeSpeed = TTS_SPEED_OVERRIDE != null ? TTS_SPEED_OVERRIDE : TTS_SPEED_DEFAULT;
-const clampSpeed = (v) => Math.max(0.5, Math.min(1.2, Number(v) || TTS_SPEED_DEFAULT));
-const speedFor = () => runtimeSpeed;
 const log = (m) => console.log(m);
 
 // ---------- voice store (persistent, multi-voice) ----------
@@ -394,8 +369,6 @@ async function ensureTts(lang) {
         s3genModelSrc: TTS_S3GEN_MULTILINGUAL_CHATTERBOX.src,
         referenceAudioSrc: ref,
         useGPU: true,
-        speed: speedFor(lang),   // native pitch-preserving pace (load-time, per language)
-        ...TTS_STREAM_CFG,
       },
       onProgress: (p) => { if (p && p.percentage != null) { log(`  chatterbox: ${p.percentage.toFixed(0)}%`); onProgress(p); } },
     }));
@@ -816,7 +789,6 @@ const server = http.createServer(async (req, res) => {
         sttLangs: STT_LANGS,
         transcriptionEngine: "parakeet-transcription",
         ttsEngine: "chatterbox",
-        speed: runtimeSpeed,
       });
     }
 
@@ -844,28 +816,11 @@ const server = http.createServer(async (req, res) => {
       invalidateSetupQueues();
       const cleared = await serializeWorker(async () => {
         const clearedVoices = await clearVoices();
-        runtimeSpeed = TTS_SPEED_DEFAULT;
         await dropAllResidentModels();
         return clearedVoices;
       });
       log(`Demo reset: cleared ${cleared} voice(s), unloaded resident models.`);
-      return send(res, 200, { ok: true, cleared, speed: runtimeSpeed });
-    }
-
-    // Live speaking-rate control (demo): set the load-time speed; drop resident TTS models so
-    // the next synth reloads at the new rate, then re-warm the current/demo languages.
-    if (req.method === "POST" && pathOnly === "/api/speed") {
-      let v = runtimeSpeed;
-      try { v = clampSpeed(JSON.parse((await readBody(req)).toString() || "{}").speed); } catch {}
-      if (v !== runtimeSpeed) {
-        invalidateSetupQueues();
-        await serializeWorker(async () => {
-          runtimeSpeed = v;
-          await dropTts();   // models bake speed at load time -> force reload at the new rate
-        });
-        log(`Speed set to ${runtimeSpeed} (resident TTS dropped; will reload on next synth).`);
-      }
-      return send(res, 200, { ok: true, speed: runtimeSpeed });
+      return send(res, 200, { ok: true, cleared });
     }
 
     // Capture a "Receive Prototype Link" email -> append to ~/.qvac-voice-relay/emails.json.
@@ -1062,7 +1017,7 @@ const server = http.createServer(async (req, res) => {
           });
         }
         res.end();
-        log(`TTS stream: first ${firstChunkMs == null ? "none" : `${firstChunkMs.toFixed(0)}ms`}, total ${synthMs.toFixed(0)}ms, ${stats.samples} samples (${(stats.samples / CHATTERBOX_SR).toFixed(2)}s) speed=${speedFor(to)} (${to})`);
+        log(`TTS stream: first ${firstChunkMs == null ? "none" : `${firstChunkMs.toFixed(0)}ms`}, total ${synthMs.toFixed(0)}ms, ${stats.samples} samples (${(stats.samples / CHATTERBOX_SR).toFixed(2)}s) (${to})`);
       });
       return;
     }

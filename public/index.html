@@ -88,13 +88,6 @@
       .vr-head{display:flex}
       .vr-head .half{flex:1;display:flex;align-items:center;gap:8px;padding:8px 12px}
       .vr-head .half.right{justify-content:flex-start}
-      .speed-ctl{display:flex;align-items:center;gap:10px}
-      .speed-ctl input[type=range]{-webkit-appearance:none;appearance:none;height:4px;flex:1;border-radius:3px;background:var(--panel);outline:none}
-      .speed-ctl input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:var(--accent);cursor:pointer}
-      .speed-ctl #speedVal{min-width:40px;text-align:right;color:var(--accent);font-weight:600}
-      .ob-settings{position:absolute;top:16px;right:16px;width:40px;height:40px;display:flex;align-items:center;justify-content:center;border:none;border-radius:var(--r-btn);background:transparent;color:var(--muted);cursor:pointer;z-index:5}
-      .ob-settings:hover{background:var(--panel);color:var(--text)}
-      .m-note{font-size:12px;color:var(--muted);line-height:1.45;margin:12px 0 0}
       .lbl{font-size:12px;font-weight:500;color:var(--muted)}
       .dd{display:inline-flex;align-items:center;gap:8px;height:36px;padding:8px 12px;border:none;border-radius:var(--r-btn);
         background:transparent;color:var(--text);font-family:inherit;font-size:14px;font-weight:400;cursor:pointer;transition:.12s}
@@ -216,7 +209,6 @@
   <body>
     <!-- ===== ONBOARDING ===== -->
     <section class="onboard" id="onboard">
-      <button class="ob-settings" id="btnSettings" title="Settings" aria-label="Settings"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
       <div class="ob-inner">
         <div class="hero"><div class="mark" id="heroMark"></div></div>
         <div class="ob-text">
@@ -312,19 +304,6 @@
           <div class="m-content"><h2 class="m-h2">Read this phrase</h2><div class="phrase-box" id="cloneScript"></div></div>
           <div class="m-cta"><div class="listening"><span class="wave"><i style="animation-delay:0s"></i><i style="animation-delay:.15s"></i><i style="animation-delay:.3s"></i><i style="animation-delay:.45s"></i></span> <span id="cloneStatus">Listening...</span></div><button class="btn-white" id="cloneDone"></button></div>
         </div>
-      </div>
-    </div>
-
-    <!-- ===== SETTINGS MODAL (pre-clone; set the voice speed before the demo) ===== -->
-    <div class="overlay" id="settingsModal">
-      <div class="modal">
-        <div class="m-head"><span class="m-title">Settings</span><button class="m-iconbtn" data-close="settingsModal"></button></div>
-        <div class="m-content">
-          <div class="field-label">Voice speed</div>
-          <div class="speed-ctl"><input type="range" id="speedSlider" min="0.6" max="1" step="0.05" value="1"><span class="lbl" id="speedVal">1.0x</span></div>
-          <p class="m-note">Lower is slower. Set this before cloning a voice. It applies from the next spoken sentence.</p>
-        </div>
-        <div class="m-cta end"><button class="btn-white" data-close="settingsModal">Done</button></div>
       </div>
     </div>
 
@@ -556,21 +535,9 @@
           var keys=Object.keys(ttsLangs);
           if(keys.indexOf(tgtLang)<0) tgtLang=keys.find(function(l){return l!==fromLang;})||keys[0]||"en";
           paintFrom(); paintTo(); refreshPlaceholder();
-          if(typeof st.speed==="number") setSpeedUI(st.speed);
           await refreshSetupStatus();
         }catch(e){}
       }
-      // ---- live voice-speed control ----
-      function setSpeedUI(v){ var s=$("speedSlider"); if(s){ s.value=String(v); } var l=$("speedVal"); if(l){ l.textContent=Number(v).toFixed(2).replace(/0$/,"")+"x"; } }
-      (function(){
-        var s=$("speedSlider"); if(!s) return;
-        s.addEventListener("input",function(){ $("speedVal").textContent=Number(s.value).toFixed(2).replace(/0$/,"")+"x"; });
-        // Commit on release (change) so dragging doesn't spam reloads. Re-warms at the new rate.
-        s.addEventListener("change",function(){
-          fetch("/api/speed",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({speed:Number(s.value)})})
-            .then(function(r){return r.json();}).then(function(d){ if(d&&typeof d.speed==="number"){ setSpeedUI(d.speed); lastPrepareKey=""; prepareSelected(); } }).catch(function(){});
-        });
-      })();
 
       // ===================== DROPDOWNS =====================
       var openPop=null;
@@ -876,7 +843,6 @@
           $("app").classList.remove("show"); $("onboard").classList.remove("hidden");
           $("consentRow").classList.remove("on"); $("obStart").disabled=true;
           setSentence(ph(),true); refreshPlaceholder(); paintFrom(); paintTo();
-          if(d&&typeof d.speed==="number") setSpeedUI(d.speed);
           await refreshState();
         }catch(e){ err.textContent="Error: "+e.message; }
         finally{ $("btnReset").disabled=false; }
@@ -936,8 +902,6 @@
 
       // ---- prototype modal ----
       $("btnProto").addEventListener("click",function(){ openModal("protoModal"); setTimeout(function(){$("protoEmail").focus();},50); });
-      // Settings (pre-clone): open + sync the current speed from the server.
-      $("btnSettings").addEventListener("click",function(){ openModal("settingsModal"); fetch("/api/state").then(function(r){return r.json();}).then(function(d){ if(d&&typeof d.speed==="number") setSpeedUI(d.speed); }).catch(function(){}); });
       $("protoSend").addEventListener("click",async function(){
         var v=$("protoEmail").value.trim();
         if(!v||v.indexOf("@")<1){ $("protoEmail").focus(); return; }
